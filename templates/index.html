@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Smart Ration Dispenser</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+<style>
+  body { font-family: Arial, sans-serif; background:#f4f6f8; margin:0; padding:20px; }
+  .card { background:white; border-radius:10px; padding:20px; max-width:480px; margin:0 auto 16px; box-shadow:0 2px 6px rgba(0,0,0,0.08); }
+  h2 { margin-top:0; color:#1a3d5c; }
+  .status-badge { display:inline-block; padding:4px 12px; border-radius:14px; font-size:13px; font-weight:bold; }
+  .available { background:#eaf3de; color:#3B6D11; }
+  .unavailable { background:#fcebeb; color:#A32D2D; }
+  .row { display:flex; align-items:center; justify-content:space-between; padding:8px 0; border-bottom:1px solid #eee; }
+  .qty-controls button { width:32px; height:32px; font-size:18px; border:none; border-radius:6px; background:#1a3d5c; color:white; cursor:pointer; }
+  .qty-controls span { display:inline-block; width:70px; text-align:center; font-weight:bold; }
+  #confirmBtn, #payBtn { background:#3B6D11; color:white; border:none; padding:10px 18px; border-radius:6px; font-size:15px; cursor:pointer; margin-top:10px; }
+  .error { color:#A32D2D; font-size:13px; }
+  #qrImg { display:block; margin:10px auto; }
+  #log { font-size:12px; color:#666; max-width:480px; margin:0 auto; white-space:pre-wrap; }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <h2>Smart Ration Dispenser</h2>
+  <span id="machineStatus" class="status-badge unavailable">Checking status...</span>
+</div>
+
+<div class="card" id="scanCard">
+  <p>Waiting for card scan...</p>
+  <button onclick="simulateScan()">Simulate Card Scan (TNPDS1001)</button>
+</div>
+
+<div class="card" id="entitlementCard" style="display:none;">
+  <h3 id="custName"></h3>
+  <p id="familyInfo"></p>
+  <div id="quantityRows"></div>
+  <div id="selectionErrors" class="error"></div>
+  <button id="confirmBtn" onclick="submitSelection()">Confirm Selection</button>
+</div>
+
+<div class="card" id="billCard" style="display:none;">
+  <h3>Bill</h3>
+  <div id="billItems"></div>
+  <p><b>Total: Rs. <span id="billTotal"></span></b></p>
+  <img id="qrImg" width="200" height="200">
+  <p style="font-size:12px; color:#888;">Scan to pay (demo QR)</p>
+  <button id="payBtn" onclick="confirmPayment()">Payment Received / Proceed</button>
+</div>
+
+<div class="card" id="dispenseCard" style="display:none;">
+  <h3>Dispensing: <span id="currentCommodity"></span></h3>
+  <p id="binPrompt"></p>
+  <p>Target: <span id="targetW"></span> kg | Actual: <span id="actualW">0</span> kg</p>
+</div>
+
+<div class="card" id="doneCard" style="display:none;">
+  <h3>✅ Transaction Complete</h3>
+  <p>Thank you. Please collect your items.</p>
+</div>
+
+<pre id="log"></pre>
+
+<script>
+const socket = io();
+let currentCardId = null;
+let remaining = {};
+let selections = {rice:0, wheat:0, dal:0, sugar:0};
+const STEP = 0.1; // 100g steps
+
+function log(msg) {
+  document.getElementById('log').textContent += msg + "\n";
+}
+
+function simulateScan() {
+  // In real deployment, the ESP32 sends this event when the RFID/fingerprint is scanned.
+  // Button here is only for testing the UI without hardware attached.
+  fetch('/'); // no-op, actual scan comes from simulate_esp32.py over the socket
+  log("Waiting for simulate_esp32.py to send a card scan...");
+}
+
+socket.on('entitlement_data', (data) => {
+  currentCardId = data.card_id;
+  remaining = data.remaining;
+  document.getElementById('scanCard').style.display = 'none';
+  document.getElementById('entitlementCard').style.display = 'block';
+  document.getElementById('custName').textContent = data.name + " (" + data.card_id + ")";
+  document.getElementById('familyInfo').textContent = "Family members: " + data.family_members;
+
+  const rowsDiv = document.getElementById('quantityRows');
+  rowsDiv.innerHTML = '';
+  for (const commodity of ['rice','wheat','dal','sugar']) {
+    selections[commodity] = 0;
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = `
+      <span>${commodity[0].toUpperCase()+commodity.slice(1)} (max ${remaining[commodity]}kg)${data.prices[commodity]===0 ? ' - FREE' : ''}</span>
+      <div class="qty-controls">
+        <button onclick="adjustQty('${commodity}', -1)">-</button>
+        <span id="qty_${commodity}">0.0</span>
+        <button onclick="adjustQty('${commodity}', 1)">+</button>
+      </div>`;
+    rowsDiv.appendChild(row);
+  }
+  log("Entitlement loaded for " + data.name);
+});
+
+socket.on('invalid_card', (data) => {
+  log("Invalid card: " + data.card_id);
+});
+
+function adjustQty(commodity, dir) {
+  let val = selections[commodity] + dir * STEP;
+  val = Math.round(val * 10) / 10;
+  if (val < 0) val = 0;
+  if (val > remaining[commodity]) val = remaining[commodity];
+  selections[commodity] = val;
+  document.getElementById('qty_' + commodity).textContent = val.toFixed(1);
+}
+
+function submitSelection() {
+  document.getElementById('selectionErrors').textContent = '';
+  socket.emit('ui_select_quantities', {card_id: currentCardId, selections: selections});
+}
+
+socket.on('selection_errors', (data) => {
+  document.getElementById('selectionErrors').textContent = Object.values(data.errors).join(' | ');
+});
+
+let pendingItems = [];
+socket.on('bill_ready', (data) => {
+  document.getElementById('entitlementCard').style.display = 'none';
+  document.getElementById('billCard').style.display = 'block';
+  pendingItems = data.items;
+  const billDiv = document.getElementById('billItems');
+  billDiv.innerHTML = data.items.map(i => `<div class="row"><span>${i.commodity} - ${i.quantity_kg}kg</span><span>Rs. ${i.price}</span></div>`).join('');
+  document.getElementById('billTotal').textContent = data.total_amount;
+  const qrImg = document.getElementById('qrImg');
+  if (data.qr_image_base64) {
+    qrImg.src = 'data:image/png;base64,' + data.qr_image_base64;
+    qrImg.style.display = 'block';
+  } else {
+    qrImg.style.display = 'none';
+    log("All items free — no payment needed");
+  }
+});
+
+function confirmPayment() {
+  document.getElementById('billCard').style.display = 'none';
+  document.getElementById('dispenseCard').style.display = 'block';
+  socket.emit('ui_confirm_payment', {items: pendingItems});
+}
+
+socket.on('bin_prompt', (data) => {
+  document.getElementById('currentCommodity').textContent = data.commodity;
+  document.getElementById('binPrompt').textContent = "Place your container for " + data.commodity + "...";
+});
+
+socket.on('bin_timeout', (data) => {
+  document.getElementById('binPrompt').textContent = "Timeout! Please place your container for " + data.commodity + " now.";
+});
+
+socket.on('dispense_progress', (data) => {
+  document.getElementById('targetW').textContent = data.target_weight_kg;
+  document.getElementById('actualW').textContent = data.actual_weight_kg;
+});
+
+socket.on('dispense_item_done', (data) => {
+  log(`${data.commodity} done: target=${data.target_weight_kg}kg actual=${data.final_weight_kg}kg status=${data.status} charged=Rs.${data.price_charged}`);
+});
+
+socket.on('transaction_complete', (data) => {
+  document.getElementById('dispenseCard').style.display = 'none';
+  document.getElementById('doneCard').style.display = 'block';
+});
+
+socket.on('machine_status', (data) => {
+  const badge = document.getElementById('machineStatus');
+  badge.textContent = data.available ? 'Machine Available' : 'Machine Unavailable';
+  badge.className = 'status-badge ' + (data.available ? 'available' : 'unavailable');
+});
+</script>
+
+</body>
+</html>
